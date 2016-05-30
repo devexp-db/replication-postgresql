@@ -1,0 +1,146 @@
+#! /bin/sh
+
+# Simple and ugly script to configure warm-standby replication on RHEL 6
+# Copyright (C) 2016 Red Hat, Inc.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+
+LIBDIR="$(dirname  "$(readlink -f "$0")")"/../lib
+SSH_KEY_FILE=postgres-ssh-key
+MASTER_IP=$1
+SLAVE_IP=$2
+
+# library code
+. "$LIBDIR"/funclib.sh
+. "$LIBDIR"/helpers.sh
+
+run_on_master ()
+{
+    echo " * MASTER CMD: $1"
+    ssh_f "root@$MASTER_IP" "$1"
+}
+
+run_on_master_as_postgres ()
+{
+    func_quote pretty su - postgres -c "$1"
+    run_on_master "$func_quote_result"
+}
+
+run_on_slave_as_postgres ()
+{
+    func_quote pretty su - postgres -c "$1"
+    run_on_slave "$func_quote_result"
+}
+
+run_on_slave ()
+{
+    echo " * SLAVE CMD: $*"
+    ssh_f "root@$SLAVE_IP" "$@"
+}
+
+# copy_to master/slave SRC DEST OWNER PERMISSIONS
+# -----------------------------------------------
+copy_to ()
+{
+    ip=$MASTER_IP
+    cmd=run_on_master
+    case $1 in
+      slave)
+        ip=$SLAVE_IP
+        cmd=run_on_slave
+        ;;
+    esac
+    shift
+
+    echo "copying $1 to $2 on $ip"
+    scp_f "$1" "root@$ip:$2"
+
+    $cmd "chown $3:$3 $2"
+    $cmd "chmod $4 $2"
+}
+
+## START HERE ##
+
+# sanity checks
+set -e
+test "$#" -lt 2 && die "I expect 2 parameters: $0 master-IP slave-IP"
+
+# Generate keys..
+if test ! -f "$SSH_KEY_FILE"
+then
+    rm -rf ./"$SSH_KEY_FILE".pub
+    ssh-keygen -N "" -f "$SSH_KEY_FILE"
+fi
+
+# Install packages
+run_on_master                   'yum install -y postgresql-server rsync'
+run_on_slave                    'yum install -y postgresql-server postgresql-contrib'
+
+# Configure ssh between master & slave
+ssh_dir="/var/lib/pgsql/.ssh"
+cmd="mkdir -p $ssh_dir \
+     && cp /root/.ssh/authorized_keys $ssh_dir \
+     && chown -R postgres:postgres $ssh_dir \
+     && chmod 600 $ssh_dir/authorized_keys"
+run_on_master "$cmd"
+run_on_slave  "$cmd"
+key_file=/var/lib/pgsql/.ssh/id_rsa
+copy_to master "$SSH_KEY_FILE" "$key_file" postgres 600
+
+run_on_master 'restorecon -RvF /var/lib/pgsql'
+run_on_slave 'restorecon -RvF /var/lib/pgsql'
+ssh_copy_id_f -f -i "$SSH_KEY_FILE".pub postgres@"$SLAVE_IP"
+
+run_on_master_as_postgres 'test -f .ssh/config || echo "StrictHostKeyChecking=no" > .ssh/config ; chmod 600 ~/.ssh/config'
+
+
+# Configure master server and start.
+run_on_master 'service postgresql initdb'
+copy_to master master.conf /var/lib/pgsql/master.conf postgres 644
+run_on_master_as_postgres "sed s/@IP@/$SLAVE_IP/ ~/master.conf > ~/data/master.conf"
+run_on_master_as_postgres "grep \"include 'master.conf'\" data/postgresql.conf || echo \"include 'master.conf'\" >> data/postgresql.conf"
+
+run_on_master "setsebool -P postgresql_can_rsync 1"
+run_on_master "service postgresql start"
+
+# Start syncing with standby (on master)
+run_on_master_as_postgres 'psql -c "select pg_start_backup('\''the_first_backup'\'');"'
+
+# Carbon copy of database sent to standby
+run_on_master_as_postgres "rsync -av --exclude pg_xlog/* --exclude postgresql.pid data/* $SLAVE_IP:/var/lib/pgsql/data"
+
+# We use master's configuration, but we are not master -- so remove master specific line.
+run_on_slave_as_postgres "sed -i 's/^include.*//' data/postgresql.conf"
+
+# Install recovery.conf.
+copy_to slave recovery.conf /var/lib/pgsql/data/recovery.conf postgres 644
+run_on_slave_as_postgres 'mkdir -p data/archive'
+
+# Start slave server.
+run_on_slave "service postgresql start"
+
+# Start the replication on master.
+run_on_master_as_postgres 'psql -c "select pg_stop_backup();"'
+
+# A bit of help.
+cat <<EOF
+try to use:
+   ssh root@$MASTER_IP -> 'psql' and commit something
+
+check that on ssh root@$MASTER_IP there is something in data/archive directory
+
+Try to run 'pg_ctl promote' on slave.
+EOF

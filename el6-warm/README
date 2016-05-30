@@ -1,0 +1,9 @@
+Prerequisites:  You should have RHEL 6 virtual machines.  Both machines
+must be subscribed (available RHEL 6 repositories).  You need to be able
+to ssh to root user without password to both of them.
+
+Then, simply run './run MASTER_IP SLAVE_IP'.
+
+This is just toy example of replication, used as debugging example.
+Please, consult the 'run' script carefully to what is happening in
+background.
