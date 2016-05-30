@@ -140,7 +140,10 @@ cat <<EOF
 try to use:
    ssh root@$MASTER_IP -> 'psql' and commit something
 
-check that on ssh root@$MASTER_IP there is something in data/archive directory
+check that on 'ssh root@$SLAVE_IP' there is something in data/archive
+directory, and that the data/pg_log/* shows that the WAL files are applied on
+slave.
 
-Try to run 'pg_ctl promote' on slave.
+To trigger failover, touch /tmp/failover file on slave (this is not secure
+method btw!).
 EOF
